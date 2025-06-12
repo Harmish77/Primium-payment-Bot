@@ -1,393 +1,318 @@
 import os
 import logging
 from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from dotenv import load_dotenv
+from telegram import Update, Bot
 from telegram.ext import (
-    Updater,
+    Application,
     CommandHandler,
     MessageHandler,
-    Filters,
-    CallbackContext,
-    CallbackQueryHandler
+    filters,
+    ContextTypes,
 )
+from pymongo import MongoClient
+import re
 
-# Configure logging
+# Load environment variables from .env file
+load_dotenv()
+
+# --- Configuration ---
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+MONGO_URI = os.getenv("MONGO_URI")
+YOUR_TELEGRAM_USER_ID = int(os.getenv("YOUR_TELEGRAM_USER_ID"))  # Convert to int
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID"))  # Convert to int
+AUTO_FILTER_BOT_USERNAME = os.getenv("AUTO_FILTER_BOT_USERNAME") # Your auto-filter bot's username (without @)
+
+# --- Logging Setup ---
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Bot configuration
-TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-ADMIN_IDS = [int(id) for id in os.getenv('ADMIN_IDS', '').split(',') if id]
-AUTO_FILTER_BOT_USERNAME = os.getenv('AUTO_FILTER_BOT_USERNAME', 'your_auto_filter_bot_username')
-DATABASE_URL = os.getenv('DATABASE_URL')
+# --- MongoDB Setup ---
+try:
+    client = MongoClient(MONGO_URI)
+    db = client.get_database()  # Gets the default database specified in the URI
+    payments_collection = db["payments"]
+    users_collection = db["users"] # Optional: to store general user info if needed
+    logger.info("MongoDB connected successfully.")
+except Exception as e:
+    logger.error(f"Error connecting to MongoDB: {e}")
+    # Exit or handle gracefully if DB connection is critical
 
-# Premium durations mapping
-DURATION_MAPPING = {
-    '3day': '3days',
-    '7day': '7days',
-    '30day': '1month',
-    '90day': '3months',
-    '180day': '6months',
-    '365day': '1year'
-}
+# --- Helper Functions ---
 
-class PremiumBot:
-    def __init__(self):
-        self.updater = Updater(TOKEN, use_context=True)
-        self.dp = self.updater.dispatcher
-        
-        # Add handlers
-        self.dp.add_handler(CommandHandler("start", self.start))
-        self.dp.add_handler(MessageHandler(Filters.text & ~Filters.command, self.handle_message))
-        self.dp.add_handler(CallbackQueryHandler(self.button))
-        
-        # Error handler
-        self.dp.add_error_handler(self.error_handler)
-        
-        # Initialize database
-        self.init_db()
+def parse_time_period(amount):
+    """
+    Interpolates the time period in days based on the amount paid,
+    using the provided tier structure from your JS.
+    Returns a string like '3days', '1month', '1year', etc.
+    """
+    tiers = [
+        {"amount": 5, "days": 3},
+        {"amount": 10, "days": 7},
+        {"amount": 25, "days": 30},
+        {"amount": 60, "days": 90},
+        {"amount": 100, "days": 180},
+        {"amount": 150, "days": 365},
+    ]
 
-    def init_db(self):
-        """Initialize database connection"""
-        # For Koyeb, you might want to use their built-in PostgreSQL
-        # or connect to an external DB
-        try:
-            import psycopg2
-            self.conn = psycopg2.connect(DATABASE_URL)
-            self.create_tables()
-        except Exception as e:
-            logger.error(f"Database connection error: {e}")
-            self.conn = None
+    amount = max(5, min(150, amount)) # Clamp amount between 5 and 150
 
-    def create_tables(self):
-        """Create necessary tables if they don't exist"""
-        if not self.conn:
-            return
+    exact_tier = next((t for t in tiers if t["amount"] == amount), None)
+    if exact_tier:
+        total_days = exact_tier["days"]
+    else:
+        # Handle amounts below first tier
+        if amount < tiers[0]["amount"]:
+            total_days = max(1, round((amount / tiers[0]["amount"]) * tiers[0]["days"]))
+        # Handle amounts above last tier (simple linear extrapolation)
+        elif amount > tiers[-1]["amount"]:
+            total_days = round((amount / tiers[-1]["amount"]) * tiers[-1]["days"])
+        else:
+            # Interpolate for amounts within tiers
+            lower_tier, upper_tier = None, None
+            for i in range(len(tiers) - 1):
+                if amount >= tiers[i]["amount"] and amount <= tiers[i+1]["amount"]:
+                    lower_tier = tiers[i]
+                    upper_tier = tiers[i+1]
+                    break
             
-        try:
-            cur = self.conn.cursor()
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS payments (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT NOT NULL,
-                    username VARCHAR(255),
-                    amount INTEGER NOT NULL,
-                    txn_id VARCHAR(50) UNIQUE NOT NULL,
-                    duration VARCHAR(20) NOT NULL,
-                    payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    processed BOOLEAN DEFAULT FALSE,
-                    processed_date TIMESTAMP
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS premium_users (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT UNIQUE NOT NULL,
-                    username VARCHAR(255),
-                    expiry_date TIMESTAMP NOT NULL,
-                    payment_id INTEGER REFERENCES payments(id)
-                )
-            """)
-            self.conn.commit()
-            cur.close()
-        except Exception as e:
-            logger.error(f"Error creating tables: {e}")
-            self.conn.rollback()
+            if lower_tier and upper_tier:
+                # Calculate proportional days based on tier rates
+                # This is a simplification; a more precise interpolation
+                # would match your JavaScript's `effectiveRate` calculation.
+                # For simplicity, we'll do linear interpolation here.
+                ratio = (amount - lower_tier["amount"]) / (upper_tier["amount"] - lower_tier["amount"])
+                total_days = round(lower_tier["days"] + ratio * (upper_tier["days"] - lower_tier["days"]))
+            else:
+                total_days = 0 # Should not happen with clamping
 
-    def start(self, update: Update, context: CallbackContext) -> None:
-        """Send a message when the command /start is issued."""
-        user = update.effective_user
-        update.message.reply_text(
-            f'Hi {user.first_name}! This bot handles premium subscriptions for Movie Hub.\n\n'
-            'If you\'ve made a payment, please send your Telegram username and transaction ID.'
+    # Convert total_days into optimal 'Xdays', 'Xmonth', 'Xyear' format for the bot
+    if total_days >= 365 and total_days % 365 == 0:
+        return f"{total_days // 365}year"
+    elif total_days >= 30 and total_days % 30 == 0:
+        return f"{total_days // 30}month"
+    elif total_days > 0:
+        return f"{total_days}days"
+    else:
+        return "1day" # Default to 1 day for very small or zero amounts
+
+async def log_to_channel(context: ContextTypes.DEFAULT_TYPE, message: str):
+    """Sends a message to the designated log channel."""
+    try:
+        await context.bot.send_message(chat_id=LOG_CHANNEL_ID, text=message)
+        logger.info(f"Logged to channel: {message}")
+    except Exception as e:
+        logger.error(f"Failed to send log to channel: {e}")
+
+# --- Command Handlers ---
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Sends a welcome message and instructions."""
+    await update.message.reply_text(
+        "Hello! Welcome to Movie Hub Premium Payment Bot.\n\n"
+        "To activate your premium access, please send me your:\n"
+        "1. **Telegram Username** (without @)\n"
+        "2. **UPI Transaction ID** (12 digits)\n"
+        "3. **Amount Paid** (e.g., `Harmish 123456789012 100`)\n\n"
+        "Example: `MyUsername 123456789012 10`\n\n"
+        "Make sure to send the payment screenshot to @Mr_HKs on Telegram after sending details here."
+    )
+
+async def handle_payment_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles incoming payment detail messages."""
+    text = update.message.text
+    user_telegram_id = update.message.from_user.id
+
+    # Regex to parse the message: Username, 12-digit Txn ID, Amount (integer/float)
+    match = re.match(r"(\S+)\s+(\d{12})\s+(\d+(\.\d+)?)", text)
+
+    if not match:
+        await update.message.reply_text(
+            "❌ Invalid format. Please send your details in this format:\n"
+            "`YourUsername 123456789012 10` (Username, Transaction ID, Amount)"
         )
+        return
 
-    def handle_message(self, update: Update, context: CallbackContext) -> None:
-        """Handle incoming messages with payment details"""
-        user_id = update.effective_user.id
-        text = update.message.text
-        
-        # Check if message contains payment details (sent from your payment page)
-        if "Transaction ID:" in text and "Amount Paid:" in text:
-            self.process_payment_details(update, text)
-        elif user_id in ADMIN_IDS:
-            self.handle_admin_command(update, text)
-        else:
-            update.message.reply_text(
-                "Please provide your payment details in this format:\n\n"
-                "Username: your_username\n"
-                "Transaction ID: 123456789012\n"
-                "Amount: 25"
-            )
+    telegram_username = match.group(1)
+    txn_id = match.group(2)
+    amount_str = match.group(3)
 
-    def process_payment_details(self, update: Update, text: str) -> None:
-        """Process payment details from the payment page"""
-        try:
-            # Parse the message (adjust based on your payment page format)
-            lines = text.split('\n')
-            data = {}
-            for line in lines:
-                if ':' in line:
-                    key, value = line.split(':', 1)
-                    data[key.strip().lower()] = value.strip()
-            
-            username = data.get('telegram username', '').replace('@', '')
-            txn_id = data.get('transaction id', '')
-            amount = int(data.get('amount', '0').replace('₹', '').strip())
-            
-            if not username or not txn_id or amount <= 0:
-                update.message.reply_text("Invalid payment details. Please check and try again.")
-                return
-            
-            # Determine duration based on amount
-            duration = self.get_duration_from_amount(amount)
-            
-            # Store payment in database
-            if self.conn:
-                try:
-                    cur = self.conn.cursor()
-                    cur.execute("""
-                        INSERT INTO payments (user_id, username, amount, txn_id, duration)
-                        VALUES (%s, %s, %s, %s, %s)
-                        RETURNING id
-                    """, (update.effective_user.id, username, amount, txn_id, duration))
-                    payment_id = cur.fetchone()[0]
-                    self.conn.commit()
-                    
-                    # Create keyboard with confirm button
-                    keyboard = [
-                        [InlineKeyboardButton("✅ Confirm Payment", callback_data=f"confirm_{payment_id}")],
-                        [InlineKeyboardButton("❌ Reject Payment", callback_data=f"reject_{payment_id}")]
-                    ]
-                    reply_markup = InlineKeyboardMarkup(keyboard)
-                    
-                    # Notify admin
-                    for admin_id in ADMIN_IDS:
-                        context.bot.send_message(
-                            admin_id,
-                            f"New payment received:\n\n"
-                            f"User: @{username}\n"
-                            f"Amount: ₹{amount}\n"
-                            f"Duration: {duration}\n"
-                            f"TXN ID: {txn_id}",
-                            reply_markup=reply_markup
-                        )
-                    
-                    update.message.reply_text(
-                        "Thank you for your payment! Your premium access is being processed. "
-                        "You'll receive a confirmation shortly."
-                    )
-                    
-                except Exception as e:
-                    logger.error(f"Database error: {e}")
-                    update.message.reply_text("An error occurred. Please contact support.")
-                    self.conn.rollback()
-            else:
-                update.message.reply_text("Database connection error. Please contact support.")
-            
-        except Exception as e:
-            logger.error(f"Error processing payment: {e}")
-            update.message.reply_text("Invalid payment details format. Please contact support.")
-
-    def get_duration_from_amount(self, amount: int) -> str:
-        """Map payment amount to duration string"""
-        if amount == 5:
-            return "3day"
-        elif amount == 10:
-            return "7day"
-        elif amount == 25:
-            return "30day"
-        elif amount == 60:
-            return "90day"
-        elif amount == 100:
-            return "180day"
-        elif amount == 150:
-            return "365day"
-        else:
-            # For custom amounts, default to days based on amount/5 ratio
-            days = max(1, amount // 5)
-            return f"{days}day"
-
-    def button(self, update: Update, context: CallbackContext) -> None:
-        """Handle button callbacks"""
-        query = update.callback_query
-        query.answer()
-        
-        if query.data.startswith('confirm_'):
-            payment_id = int(query.data.split('_')[1])
-            self.confirm_payment(update, context, payment_id)
-        elif query.data.startswith('reject_'):
-            payment_id = int(query.data.split('_')[1])
-            self.reject_payment(update, context, payment_id)
-
-    def confirm_payment(self, update: Update, context: CallbackContext, payment_id: int) -> None:
-        """Confirm payment and add premium"""
-        if not self.conn:
-            query = update.callback_query
-            query.edit_message_text("Database connection error. Cannot process payment.")
+    try:
+        amount_paid = float(amount_str)
+        if amount_paid < 5:
+            await update.message.reply_text("❌ Minimum amount is ₹5. Please pay at least ₹5.")
             return
-            
-        try:
-            cur = self.conn.cursor()
-            
-            # Get payment details
-            cur.execute("""
-                SELECT user_id, username, duration FROM payments 
-                WHERE id = %s AND processed = FALSE
-            """, (payment_id,))
-            payment = cur.fetchone()
-            
-            if not payment:
-                query = update.callback_query
-                query.edit_message_text("Payment not found or already processed.")
-                return
-                
-            user_id, username, duration = payment
-            
-            # Calculate expiry date
-            expiry_date = self.calculate_expiry_date(duration)
-            
-            # Add to premium users
-            cur.execute("""
-                INSERT INTO premium_users (user_id, username, expiry_date, payment_id)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (user_id) DO UPDATE
-                SET expiry_date = EXCLUDED.expiry_date,
-                    payment_id = EXCLUDED.payment_id
-            """, (user_id, username, expiry_date, payment_id))
-            
-            # Mark payment as processed
-            cur.execute("""
-                UPDATE payments SET processed = TRUE, processed_date = NOW()
-                WHERE id = %s
-            """, (payment_id,))
-            
-            self.conn.commit()
-            
-            # Send /add_premium command to auto filter bot
-            duration_cmd = DURATION_MAPPING.get(duration, duration)
-            context.bot.send_message(
-                AUTO_FILTER_BOT_USERNAME,
-                f"/add_premium {user_id} {duration_cmd}"
-            )
-            
-            # Notify user
-            context.bot.send_message(
-                user_id,
-                f"🎉 Your premium access has been activated for {duration_cmd}!\n\n"
-                "Thank you for subscribing to Movie Hub Premium."
-            )
-            
-            # Update admin message
-            query = update.callback_query
-            query.edit_message_text(
-                f"✅ Payment confirmed and premium access granted to @{username} for {duration_cmd}."
-            )
-            
-        except Exception as e:
-            logger.error(f"Error confirming payment: {e}")
-            query = update.callback_query
-            query.edit_message_text("Error processing payment. Please try again.")
-            self.conn.rollback()
-
-    def calculate_expiry_date(self, duration: str) -> datetime:
-        """Calculate expiry date from duration string"""
-        now = datetime.now()
-        
-        if duration.endswith('day'):
-            days = int(duration[:-3])
-            return now + timedelta(days=days)
-        elif duration.endswith('month'):
-            months = int(duration[:-5])
-            return now + timedelta(days=months*30)
-        elif duration.endswith('year'):
-            years = int(duration[:-4])
-            return now + timedelta(days=years*365)
-        else:
-            # Default to 1 month if format not recognized
-            return now + timedelta(days=30)
-
-    def reject_payment(self, update: Update, context: CallbackContext, payment_id: int) -> None:
-        """Reject a payment"""
-        if not self.conn:
-            query = update.callback_query
-            query.edit_message_text("Database connection error. Cannot process payment.")
+        if amount_paid > 150:
+            await update.message.reply_text("❌ Maximum amount for automatic activation is ₹150. For higher amounts, please contact @Mr_HKs directly.")
             return
-            
-        try:
-            cur = self.conn.cursor()
-            
-            # Get payment details
-            cur.execute("""
-                SELECT user_id, username FROM payments 
-                WHERE id = %s AND processed = FALSE
-            """, (payment_id,))
-            payment = cur.fetchone()
-            
-            if not payment:
-                query = update.callback_query
-                query.edit_message_text("Payment not found or already processed.")
-                return
-                
-            user_id, username = payment
-            
-            # Delete payment record
-            cur.execute("""
-                DELETE FROM payments WHERE id = %s
-            """, (payment_id,))
-            
-            self.conn.commit()
-            
-            # Notify user
-            context.bot.send_message(
-                user_id,
-                "❌ Your payment was rejected by the admin. Please contact support if you believe this is an error."
-            )
-            
-            # Update admin message
-            query = update.callback_query
-            query.edit_message_text(f"❌ Payment from @{username} rejected and deleted.")
-            
-        except Exception as e:
-            logger.error(f"Error rejecting payment: {e}")
-            query = update.callback_query
-            query.edit_message_text("Error rejecting payment. Please try again.")
-            self.conn.rollback()
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount. Please enter a valid number.")
+        return
 
-    def handle_admin_command(self, update: Update, text: str) -> None:
-        """Handle admin commands"""
-        if text.startswith('/addpremium'):
-            parts = text.split()
-            if len(parts) == 3:
-                try:
-                    user_id = int(parts[1])
-                    duration = parts[2]
-                    
-                    # Send command to auto filter bot
-                    update.message.reply_text(
-                        f"Forwarding to @{AUTO_FILTER_BOT_USERNAME}: /add_premium {user_id} {duration}"
-                    )
-                    update.message.bot.send_message(
-                        AUTO_FILTER_BOT_USERNAME,
-                        f"/add_premium {user_id} {duration}"
-                    )
-                except ValueError:
-                    update.message.reply_text("Invalid user ID. Must be a number.")
-            else:
-                update.message.reply_text("Usage: /addpremium <user_id> <duration>")
+    # Check if this transaction ID has already been processed
+    if payments_collection.find_one({"txn_id": txn_id}):
+        await update.message.reply_text(
+            "Looks like this Transaction ID has already been submitted or processed. "
+            "If you believe this is an error, please contact @Mr_HKs."
+        )
+        logger.warning(f"Duplicate transaction ID submitted: {txn_id} by {telegram_username}")
+        await log_to_channel(context, f"⚠️ Duplicate Txn ID: `{txn_id}` submitted by @{telegram_username} (User ID: `{user_telegram_id}`).")
+        return
 
-    def error_handler(self, update: Update, context: CallbackContext) -> None:
-        """Log errors"""
-        logger.error(msg="Exception while handling update:", exc_info=context.error)
+    # Determine premium duration
+    premium_duration_string = parse_time_period(amount_paid) # e.g., "3days", "1month", "1year"
 
-    def run(self):
-        """Run the bot"""
-        self.updater.start_polling()
-        self.updater.idle()
+    # Store payment details in MongoDB
+    payment_record = {
+        "user_telegram_id": user_telegram_id,
+        "telegram_username": telegram_username,
+        "txn_id": txn_id,
+        "amount_paid": amount_paid,
+        "premium_duration": premium_duration_string,
+        "submission_date": datetime.now(),
+        "status": "pending_admin_verification",
+        "processed_by_bot": False, # Flag to indicate if the bot has sent the /add_premium command
+    }
+    payments_collection.insert_one(payment_record)
+    logger.info(f"Payment record saved to DB: {payment_record}")
 
-if __name__ == '__main__':
-    bot = PremiumBot()
-    bot.run()
+    # Prepare command for auto-filter bot
+    # Note: Your auto-filter bot needs to be able to receive messages from THIS bot.
+    # It might be easier to have this bot just send a message to you (admin)
+    # and you manually forward it to the auto-filter bot if direct bot-to-bot
+    # command execution isn't set up.
+    # However, for full automation, this bot should send the command.
+
+    # Option 1: Send the command directly to the auto-filter bot
+    # This requires the auto-filter bot to recognize commands from this bot.
+    # It's generally safer if this bot directly interacts with the admin or sends a webhook.
+    # For a simple setup, if your auto-filter bot is public or in a shared group, this might work.
+    
+    # We will simulate sending to the auto-filter bot by sending it to the log channel.
+    # In a real scenario, this command needs to be sent to the auto-filter bot's chat_id
+    # or a group where both bots are present and the command is listened for.
+
+    # For automation, you'd typically send a message to a group where the auto-filter bot is.
+    # Or, the auto-filter bot has an API you can call. Since you described it as a Telegram bot,
+    # sending a message to it directly might work if it processes commands from other bots.
+    
+    # Construct the command for your auto-filter bot
+    add_premium_command = f"/add_premium {user_telegram_id} {premium_duration_string}"
+    
+    # Send confirmation to the user
+    await update.message.reply_text(
+        f"✅ Thank you! Your payment details have been received:\n"
+        f"Username: `@`{telegram_username}\n"
+        f"Transaction ID: `{txn_id}`\n"
+        f"Amount: ₹{amount_paid}\n"
+        f"Premium Period: {premium_duration_string.replace('days', ' Days').replace('month', ' Month').replace('year', ' Year')}\n\n"
+        f"Please forward your payment screenshot to @Mr_HKs to complete the activation process."
+    )
+
+    # Log to admin channel for verification and action
+    log_message = (
+        f"🔔 **New Payment Submitted!**\n"
+        f"👤 User: @{telegram_username} (ID: `{user_telegram_id}`)\n"
+        f"💳 Txn ID: `{txn_id}`\n"
+        f"💰 Amount: `₹{amount_paid}`\n"
+        f"⏳ Period: `{premium_duration_string}`\n"
+        f"🤖 **Action Needed:** Send this command to `{AUTO_FILTER_BOT_USERNAME}`: \n"
+        f"`{add_premium_command}`"
+    )
+    await log_to_channel(context, log_message)
+
+    # Mark as processed by bot in DB if direct command sent successfully or if you trust manual process
+    # If this bot is meant to directly trigger the auto-filter bot, then upon successful triggering,
+    # you'd update the database:
+    payments_collection.update_one(
+        {"txn_id": txn_id},
+        {"$set": {"processed_by_bot": True, "processed_date": datetime.now()}}
+    )
+    logger.info(f"Command prepared for auto-filter bot for Txn ID {txn_id}: {add_premium_command}")
+
+
+async def check_payments(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command to check pending payments."""
+    if update.message.from_user.id != YOUR_TELEGRAM_USER_ID:
+        await update.message.reply_text("You are not authorized to use this command.")
+        return
+
+    pending_payments = payments_collection.find({"status": "pending_admin_verification"})
+    
+    response = "📊 **Pending Payments:**\n\n"
+    found = False
+    for payment in pending_payments:
+        found = True
+        response += (
+            f"👤 User: @{payment.get('telegram_username', 'N/A')} (ID: `{payment.get('user_telegram_id', 'N/A')}`)\n"
+            f"💳 Txn ID: `{payment.get('txn_id', 'N/A')}`\n"
+            f"💰 Amount: `₹{payment.get('amount_paid', 'N/A')}`\n"
+            f"⏳ Period: `{payment.get('premium_duration', 'N/A')}`\n"
+            f"⏰ Submitted: `{payment.get('submission_date').strftime('%Y-%m-%d %H:%M:%S')}`\n"
+            f"Command: `/add_premium {payment.get('user_telegram_id', 'N/A')} {payment.get('premium_duration', 'N/A')}`\n\n"
+        )
+    
+    if not found:
+        response = "✅ No pending payments found."
+
+    await update.message.reply_text(response, parse_mode="Markdown")
+
+
+async def mark_processed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command to manually mark a payment as processed."""
+    if update.message.from_user.id != YOUR_TELEGRAM_USER_ID:
+        await update.message.reply_text("You are not authorized to use this command.")
+        return
+    
+    args = context.args
+    if not args or len(args) != 1:
+        await update.message.reply_text("Usage: `/mark_processed <transaction_id>`")
+        return
+    
+    txn_id_to_mark = args[0]
+    result = payments_collection.update_one(
+        {"txn_id": txn_id_to_mark},
+        {"$set": {"status": "processed", "admin_processed_date": datetime.now()}}
+    )
+    
+    if result.modified_count > 0:
+        await update.message.reply_text(f"✅ Transaction ID `{txn_id_to_mark}` marked as processed.")
+        await log_to_channel(context, f"✅ Admin (`{update.message.from_user.id}`) marked Txn ID `{txn_id_to_mark}` as processed.")
+    else:
+        await update.message.reply_text(f"❌ Transaction ID `{txn_id_to_mark}` not found or already processed.")
+
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log the error and send a message to the user."""
+    logger.error(f"Update {update} caused error {context.error}")
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            "Oops! Something went wrong. Please try again later or contact @Mr_HKs if the problem persists."
+        )
+    await log_to_channel(context, f"🚨 Bot Error: `{context.error}`\nUpdate: `{update}`")
+
+
+def main() -> None:
+    """Start the bot."""
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    # Handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("check_payments", check_payments))
+    application.add_handler(CommandHandler("mark_processed", mark_processed))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_payment_details)
+    )
+
+    # Error handler
+    application.add_error_handler(error_handler)
+
+    logger.info("Bot is starting...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
+
