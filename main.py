@@ -30,15 +30,17 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- MongoDB Setup ---
+# Replace your MongoDB connection code with:
+client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
 try:
-    client = MongoClient(MONGO_URI)
-    db = client.get_database()  # Gets the default database specified in the URI
+    client.server_info()  # Test connection
+    db = client[os.getenv("MONGO_DB_NAME", "cluster0")]  # Specify database name
     payments_collection = db["payments"]
-    users_collection = db["users"] # Optional: to store general user info if needed
     logger.info("MongoDB connected successfully.")
 except Exception as e:
-    logger.error(f"Error connecting to MongoDB: {e}")
-    # Exit or handle gracefully if DB connection is critical
+    logger.critical(f"MongoDB connection failed: {e}")
+    # Exit if DB connection is critical
+    exit(1)
 
 # --- Helper Functions ---
 
