@@ -306,11 +306,15 @@ def main() -> None:
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_payment_details)
     )
 
-    # Error handler
-    application.add_error_handler(error_handler)
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    # ... (handlers added here) ...
 
     logger.info("Bot is starting...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # This is the line that needs to change for python-telegram-bot v20+
+    application.run_polling(poll_interval=3, timeout=30, allowed_updates=Update.ALL_TYPES)
+    # You can remove poll_interval and timeout if you don't need to specify them,
+    # but run_polling() is the correct method.
 
 
 if __name__ == "__main__":
