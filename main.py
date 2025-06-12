@@ -33,16 +33,27 @@ logger = logging.getLogger(__name__)
 # --- MongoDB Setup ---
 # Replace your MongoDB connection code with:
 try:
+    # URL-encode password if needed
+    password = os.getenv("MONGO_PASSWORD")
+    if password:
+        from urllib.parse import quote_plus
+        encoded_password = quote_plus(password)
+        MONGO_URI = MONGO_URI.replace("<password>", encoded_password)
+    
     client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
     client.server_info()  # Test connection
-    db_name = os.getenv("MONGO_DB_NAME", "cluster0")
+    db_name = os.getenv("MONGO_DB_NAME", "moviehub")
     db = client[db_name]
     payments_collection = db["payments"]
     users_collection = db["users"]
     logger.info(f"MongoDB connected successfully to database: {db_name}")
 except Exception as e:
     logger.critical(f"Error connecting to MongoDB: {e}")
-    # Exit if DB connection is critical
+    # Provide detailed error message
+    if "bad auth" in str(e).lower():
+        logger.critical("Authentication failed. Please check MongoDB username and password.")
+    elif "Temporary failure in name resolution" in str(e):
+        logger.critical("Network issue. Check your DNS settings or MongoDB cluster configuration.")
     exit(1)
 
 # --- Helper Functions ---
