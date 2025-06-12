@@ -296,7 +296,8 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def main() -> None:
     """Start the bot."""
-    application = Application.builder().token(BOT_TOKEN).build() # <-- This line is key
+    # This line builds the Application object directly (no Updater involved in v20+)
+    application = Application.builder().token(BOT_TOKEN).build()
 
     # Handlers
     application.add_handler(CommandHandler("start", start))
@@ -310,9 +311,11 @@ def main() -> None:
     application.add_error_handler(error_handler)
 
     logger.info("Bot is starting...")
-    # This is the correct way to run polling for python-telegram-bot v20+
+    # This is the correct way to run the bot for python-telegram-bot v20+
     application.run_polling(poll_interval=3, timeout=30, allowed_updates=Update.ALL_TYPES)
-    # You can also use: application.run_polling() if you don't need poll_interval/timeout
+    # You can simplify the above to just: application.run_polling()
+    # if you don't need to specify interval/timeout, but either is fine.
+
 
 
 if __name__ == "__main__":
