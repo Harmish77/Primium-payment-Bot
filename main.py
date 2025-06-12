@@ -35,11 +35,14 @@ logger = logging.getLogger(__name__)
 try:
     client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
     client.server_info()  # Test connection
-    db = client[os.getenv("MONGO_DB_NAME", "cluster0")]  # Specify database name
+    db_name = os.getenv("MONGO_DB_NAME", "cluster0")
+    db = client[db_name]
     payments_collection = db["payments"]
-    logger.info("MongoDB connected successfully.")
+    users_collection = db["users"]
+    logger.info(f"MongoDB connected successfully to database: {db_name}")
 except Exception as e:
-    logger.critical(f"MongoDB connection failed: {e}")
+    logger.critical(f"Error connecting to MongoDB: {e}")
+    # Exit if DB connection is critical
     exit(1)
 
 # --- Helper Functions ---
@@ -153,6 +156,7 @@ async def handle_payment_details(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("❌ Invalid amount. Please enter a valid number.")
         return
 
+    # Now, we'll handle MongoDB operations in a separate try-except block.
     try:
         # Check if this transaction ID has already been processed
         if payments_collection.find_one({"txn_id": txn_id}):
@@ -176,66 +180,54 @@ async def handle_payment_details(update: Update, context: ContextTypes.DEFAULT_T
             "premium_duration": premium_duration_string,
             "submission_date": datetime.now(),
             "status": "pending_admin_verification",
-            "processed_by_bot": False,
+            "processed_by_bot": False, # Flag to indicate if the bot has sent the /add_premium command
         }
         payments_collection.insert_one(payment_record)
         logger.info(f"Payment record saved to DB: {payment_record}")
 
-        # ... rest of the function remains the same ...
+        # Construct the command for auto-filter bot
+        add_premium_command = f"/add_premium {user_telegram_id} {premium_duration_string}"
 
-    # Prepare command for auto-filter bot
-    # Note: Your auto-filter bot needs to be able to receive messages from THIS bot.
-    # It might be easier to have this bot just send a message to you (admin)
-    # and you manually forward it to the auto-filter bot if direct bot-to-bot
-    # command execution isn't set up.
-    # However, for full automation, this bot should send the command.
+        # Send confirmation to the user
+        await update.message.reply_text(
+            f"✅ Thank you! Your payment details have been received:\n"
+            f"Username: `@{telegram_username}`\n"
+            f"Transaction ID: `{txn_id}`\n"
+            f"Amount: ₹{amount_paid}\n"
+            f"Premium Period: {premium_duration_string.replace('days', ' Days').replace('month', ' Month').replace('year', ' Year')}\n\n"
+            f"Please forward your payment screenshot to @Mr_HKs to complete the activation process."
+        )
 
-    # Option 1: Send the command directly to the auto-filter bot
-    # This requires the auto-filter bot to recognize commands from this bot.
-    # It's generally safer if this bot directly interacts with the admin or sends a webhook.
-    # For a simple setup, if your auto-filter bot is public or in a shared group, this might work.
-    
-    # We will simulate sending to the auto-filter bot by sending it to the log channel.
-    # In a real scenario, this command needs to be sent to the auto-filter bot's chat_id
-    # or a group where both bots are present and the command is listened for.
+        # Log to admin channel for verification and action
+        log_message = (
+            f"🔔 **New Payment Submitted!**\n"
+            f"👤 User: @{telegram_username} (ID: `{user_telegram_id}`)\n"
+            f"💳 Txn ID: `{txn_id}`\n"
+            f"💰 Amount: `₹{amount_paid}`\n"
+            f"⏳ Period: `{premium_duration_string}`\n"
+            f"🤖 **Action Needed:** Send this command to `{AUTO_FILTER_BOT_USERNAME}`: \n"
+            f"`{add_premium_command}`"
+        )
+        await log_to_channel(context, log_message)
 
-    # For automation, you'd typically send a message to a group where the auto-filter bot is.
-    # Or, the auto-filter bot has an API you can call. Since you described it as a Telegram bot,
-    # sending a message to it directly might work if it processes commands from other bots.
-    
-    # Construct the command for your auto-filter bot
-    add_premium_command = f"/add_premium {user_telegram_id} {premium_duration_string}"
-    
-    # Send confirmation to the user
-    await update.message.reply_text(
-        f"✅ Thank you! Your payment details have been received:\n"
-        f"Username: `@`{telegram_username}\n"
-        f"Transaction ID: `{txn_id}`\n"
-        f"Amount: ₹{amount_paid}\n"
-        f"Premium Period: {premium_duration_string.replace('days', ' Days').replace('month', ' Month').replace('year', ' Year')}\n\n"
-        f"Please forward your payment screenshot to @Mr_HKs to complete the activation process."
-    )
+        # Mark as processed by bot in DB if direct command sent successfully or if you trust manual process
+        # We are not actually sending the command to the auto-filter bot automatically? 
+        # So we set processed_by_bot to False? Or if we are, then we would set it to True upon success?
+        # In the current design, we are just logging the command for the admin to run manually.
+        # So we leave it as False.
 
-    # Log to admin channel for verification and action
-    log_message = (
-        f"🔔 **New Payment Submitted!**\n"
-        f"👤 User: @{telegram_username} (ID: `{user_telegram_id}`)\n"
-        f"💳 Txn ID: `{txn_id}`\n"
-        f"💰 Amount: `₹{amount_paid}`\n"
-        f"⏳ Period: `{premium_duration_string}`\n"
-        f"🤖 **Action Needed:** Send this command to `{AUTO_FILTER_BOT_USERNAME}`: \n"
-        f"`{add_premium_command}`"
-    )
-    await log_to_channel(context, log_message)
-
-    # Mark as processed by bot in DB if direct command sent successfully or if you trust manual process
-    # If this bot is meant to directly trigger the auto-filter bot, then upon successful triggering,
-    # you'd update the database:
-    payments_collection.update_one(
-        {"txn_id": txn_id},
-        {"$set": {"processed_by_bot": True, "processed_date": datetime.now()}}
-    )
-    logger.info(f"Command prepared for auto-filter bot for Txn ID {txn_id}: {add_premium_command}")
+    except pymongo.errors.OperationFailure as e:
+        logger.critical(f"MongoDB operation failed: {e}")
+        await update.message.reply_text(
+            "⚠️ Database error. Please try again later or contact @Mr_HKs."
+        )
+        await log_to_channel(context, f"🚨 CRITICAL DB ERROR: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error in handle_payment_details: {e}")
+        await update.message.reply_text(
+            "⚠️ An unexpected error occurred. Please try again later or contact @Mr_HKs."
+        )
+        await log_to_channel(context, f"🚨 Unexpected error in payment handling: {e}")
 
 
 async def check_payments(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
