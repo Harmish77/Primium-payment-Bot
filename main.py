@@ -1,5 +1,6 @@
 import os
 import logging
+import pymongo.errors
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telegram import Update, Bot
@@ -31,15 +32,14 @@ logger = logging.getLogger(__name__)
 
 # --- MongoDB Setup ---
 # Replace your MongoDB connection code with:
-client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
 try:
+    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
     client.server_info()  # Test connection
     db = client[os.getenv("MONGO_DB_NAME", "cluster0")]  # Specify database name
     payments_collection = db["payments"]
     logger.info("MongoDB connected successfully.")
 except Exception as e:
     logger.critical(f"MongoDB connection failed: {e}")
-    # Exit if DB connection is critical
     exit(1)
 
 # --- Helper Functions ---
@@ -153,32 +153,35 @@ async def handle_payment_details(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("❌ Invalid amount. Please enter a valid number.")
         return
 
-    # Check if this transaction ID has already been processed
-    if payments_collection.find_one({"txn_id": txn_id}):
-        await update.message.reply_text(
-            "Looks like this Transaction ID has already been submitted or processed. "
-            "If you believe this is an error, please contact @Mr_HKs."
-        )
-        logger.warning(f"Duplicate transaction ID submitted: {txn_id} by {telegram_username}")
-        await log_to_channel(context, f"⚠️ Duplicate Txn ID: `{txn_id}` submitted by @{telegram_username} (User ID: `{user_telegram_id}`).")
-        return
+    try:
+        # Check if this transaction ID has already been processed
+        if payments_collection.find_one({"txn_id": txn_id}):
+            await update.message.reply_text(
+                "Looks like this Transaction ID has already been submitted or processed. "
+                "If you believe this is an error, please contact @Mr_HKs."
+            )
+            logger.warning(f"Duplicate transaction ID submitted: {txn_id} by {telegram_username}")
+            await log_to_channel(context, f"⚠️ Duplicate Txn ID: `{txn_id}` submitted by @{telegram_username} (User ID: `{user_telegram_id}`).")
+            return
 
-    # Determine premium duration
-    premium_duration_string = parse_time_period(amount_paid) # e.g., "3days", "1month", "1year"
+        # Determine premium duration
+        premium_duration_string = parse_time_period(amount_paid) # e.g., "3days", "1month", "1year"
 
-    # Store payment details in MongoDB
-    payment_record = {
-        "user_telegram_id": user_telegram_id,
-        "telegram_username": telegram_username,
-        "txn_id": txn_id,
-        "amount_paid": amount_paid,
-        "premium_duration": premium_duration_string,
-        "submission_date": datetime.now(),
-        "status": "pending_admin_verification",
-        "processed_by_bot": False, # Flag to indicate if the bot has sent the /add_premium command
-    }
-    payments_collection.insert_one(payment_record)
-    logger.info(f"Payment record saved to DB: {payment_record}")
+        # Store payment details in MongoDB
+        payment_record = {
+            "user_telegram_id": user_telegram_id,
+            "telegram_username": telegram_username,
+            "txn_id": txn_id,
+            "amount_paid": amount_paid,
+            "premium_duration": premium_duration_string,
+            "submission_date": datetime.now(),
+            "status": "pending_admin_verification",
+            "processed_by_bot": False,
+        }
+        payments_collection.insert_one(payment_record)
+        logger.info(f"Payment record saved to DB: {payment_record}")
+
+        # ... rest of the function remains the same ...
 
     # Prepare command for auto-filter bot
     # Note: Your auto-filter bot needs to be able to receive messages from THIS bot.
