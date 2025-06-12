@@ -295,7 +295,15 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
     await log_to_channel(context, f"🚨 Bot Error: `{context.error}`\nUpdate: `{update}`")
 
-
+async def handle_payment_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        # ... existing code ...
+    except pymongo.errors.OperationFailure as e:
+        logger.critical(f"MongoDB operation failed: {e}")
+        await update.message.reply_text(
+            "⚠️ Database error. Please try again later or contact @Mr_HKs."
+        )
+        await log_to_channel(context, f"🚨 CRITICAL DB ERROR: {e}")
 def main() -> None:
     """Start the bot."""
     application = Application.builder().token(BOT_TOKEN).build()
